@@ -1,21 +1,21 @@
 defaults:
 
   # Universal
-  run_name: 'cartpole_dynamics_1'
+  run_name: 'cartpole_rand_dynamics_new_loss_to_0.01_u_max_0.05'
   env: 'Cartpole_Env'
   seed: 0
   verbose: False
   do_prenorm: True
   prenormalize_steps: 1000
   # timesteps: 1e8 # This is currently in use as total num_env_steps.
-  timesteps: 1e4 # This is currently in use as total num_env_steps.
+  timesteps: 1e6 # This is currently in use as total num_env_steps.
 
   # Logger
   no_log: False
   logdir: "./logs/"
 
   # Model
-  model_key: 'lstm' # 'ff'
+  model_arch_key: 'lstm' # 'ff'
   model_layers: [64, 64]
   model_lr: 1e-3
   model_eps: 1e-6
@@ -24,16 +24,28 @@ defaults:
   num_env_steps: 5000 # env steps per iteration
   model_epochs: 3
   model_batch_size: 64
+  model_buffer_max_size: 1000
   previous_model: None
-  uncertainty_max: 0.5
+  # uncertainty_max: 0.05
+  model_learn_norm: False
+  uncertainty_max: 0.05
+  model_loss_goal: 0.01 # None
 
   # Policy
+  learn_policy: False
+  policy_arch_key: 'lstm'
   policy_layers: [64, 64]
   policy_fixed_std: [0.13] # None
   previous_policy: None
   policy_discount: 0.99
   policy_entropy_coeff: 0
   policy_grad_clip: 0.05
+  policy_clip: 0.2
+  actor_lr: 1e-3
+  critic_lr: 1e-3
+  policy_eps: 1e-6
+  policy_batch_size: 64
+  policy_epochs: 3
 
   # Ray
   redis_address: None

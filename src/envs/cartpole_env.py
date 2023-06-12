@@ -52,6 +52,12 @@ class Cartpole_Env:
                 else:
                     state[i] = s
         self.state = state
+    
+    def perturb_state(self):
+        (x, x_dot, theta, theta_dot) = self.state
+        x_dot += np.random.random() * 0.02
+        theta_dot += np.random.random() * 0.02
+        theta += np.random.random() * 0.05 * (1 - np.exp(-theta)) if theta > 0 else 0
 
     def step(self, action):
         assert self.state is not None, "Call reset before using step method."
@@ -83,6 +89,7 @@ class Cartpole_Env:
 
         self.state = (x, x_dot, theta, theta_dot)
         self.validate_state()
+        self.perturb_state()
 
         terminated = self.compute_done()
         reward = self.compute_reward(action)
@@ -118,6 +125,7 @@ class Cartpole_Env:
                 )
             self.steps_beyond_terminated += 1
             reward = 0.0
+        return reward
 
     def reset(self, state=None):
         # Note that if you use custom reset bounds, it may lead to out-of-bound

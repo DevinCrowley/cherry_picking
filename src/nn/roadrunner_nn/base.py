@@ -74,8 +74,8 @@ class Net(nn.Module):
         else:
             return (state - self.welford_state_mean) / sqrt(self.welford_state_mean_diff / self.welford_state_n)
     def denormalize_state(self, state):
-        state = np.array(state)
-        assert state.ndim == 1
+        state = torch.Tensor(state)
+        assert state.dim() == 1
         if state.shape[-1] < self.welford_state_mean.shape[-1]:
             state_size = state.shape[-1]
             return state * sqrt(self.welford_state_mean_diff[:state_size] / self.welford_state_n) + self.welford_state_mean[:state_size]

@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from nn.base import FF_Base, LSTM_Base, GRU_Base
+from .base import FF_Base, LSTM_Base, GRU_Base
 
 class V:
     """

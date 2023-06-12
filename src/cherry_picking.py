@@ -12,8 +12,11 @@ from torch.distributions import kl_divergence
 
 from .buffers import Model_Buffer as Env_Sample_Buffer, Policy_Buffer as Model_Sample_Buffer
 from .buffers import Policy_Buffer as Model_Sample_Buffer
-from .nn.ensemble import Ensemble_Network
+from .nn.ensemble import Ensemble_Network, get_recurrent
 from .util import train_normalizer, train_model_normalizer
+
+from .nn.roadrunner_nn.actor import LSTM_Stochastic_Actor, GRU_Stochastic_Actor, FF_Stochastic_Actor
+from .nn.roadrunner_nn.critic import LSTM_V, GRU_V, FF_V
 
 """
 Notes:
@@ -27,9 +30,9 @@ Notes:
     - Could make env.step output standardized rather than doing things piecewise.
     - Could have the model predict the reward as well as the full state.
     - TODO: normalize states and actions
-    - The Env_Sampler, which collects env data for model learning, could:
-        -> collect a batch and train on it
-        - accumulate a batch and train on all data up to that point
+- The Env_Sampler, which collects env data for model learning, could:
+    -> collect a batch and train on it
+    - accumulate a batch and train on all data up to that point
     - The Model_Sampler, which collects synthetic data for policy learning, could:
         -> predict from this batch of trajectories from Env_Sampler
         - choose a random set of trajectories to predict from
@@ -118,6 +121,7 @@ class Env_Sampler(Worker):
     def __init__(self, model, actor, critic, env_factory, config) -> None:
         super().__init__(model, actor, critic, env_factory)
         self.uncertainty_max = config.uncertainty_max
+        self.learn_norm = config.model_learn_norm
 
     def collect_experience(self, max_traj_len, min_steps):
         """
@@ -149,27 +153,30 @@ class Env_Sampler(Worker):
                 if hasattr(self.critic, 'init_hidden_state'):
                     self.critic.init_hidden_state()
 
+                state_is_real = True
                 while not done and traj_len < max_traj_len:
                     state = torch.Tensor(state)
                     action = self.actor(state, deterministic=False)
                     # value = self.critic(state)
 
                     # TODO: check how opcc does this?
-                    next_state_pred, uncertainty = self.model(state, action, update_norm=True)
+                    next_state_pred, uncertainty = self.model(state, action, update_norm=self.learn_norm)
                     if uncertainty > self.uncertainty_max:
                         next_state, reward, done, info = self.env.step(action.numpy())
                         next_state = torch.Tensor(next_state)
-                        is_real = 1
+                        next_state_is_real = 1
                     else:
                         next_state = next_state_pred.clone()
                         next_state_denormalized = self.model.inference_model.denormalize_state(next_state)
-                        self.env.set_state(next_state_denormalized)
+                        self.env.set_state(next_state_denormalized.numpy())
+                        next_state = next_state_denormalized
                         done = self.env.compute_done()
-                        is_real = 0
+                        next_state_is_real = 0
                     
-                    env_sample_buffer.push(state.numpy(), action.numpy(), is_real)
+                    env_sample_buffer.push(state.numpy(), action.numpy(), state_is_real)
                     
-                    state = next_state_denormalized
+                    state = next_state
+                    state_is_real = next_state_is_real
                     traj_len += 1
                     num_steps += 1
                 env_sample_buffer.end_trajectory()
@@ -208,10 +215,6 @@ class Env_Sampler(Worker):
                 while not done and traj_len < max_traj_len:
                     action = self.actor(state, deterministic=True)
 
-                    output = self.model(state, action, debug=True)
-                    assert output is not None, output
-                    assert len(output) == 2, type(output)
-                    raise Exception
                     next_state_pred, uncertainty = self.model(state, action)
                     next_state, reward, done, _ = self.env.step(action.numpy())
                     next_state_normalized = self.model.inference_model.normalize_state(next_state, update=False)
@@ -245,8 +248,8 @@ class Model_Optimizer(Worker):
     
     def __init__(self, model, actor, critic, env_factory, config) -> None:
         super().__init__(model, actor, critic, env_factory)
-        self.model_optim = optim.Adam(self.model.parameters(), lr=config.model_lr)
-        self.recurrent = config.model.recurrent
+        # self.model_optim = optim.Adam(self.model.parameters(), lr=config.model_lr)
+        self.recurrent = get_recurrent(config.model_arch_key)
         # self.grad_clip = config.model_grad_clip
 
     def optimize(
@@ -260,8 +263,8 @@ class Model_Optimizer(Worker):
         Does a single optimization step for the model.
         """
         torch.set_num_threads(1)
-        kl_div, losses, info = self.model.optimize(env_sample_buffer=env_sample_buffer, epochs=epochs, batch_size=batch_size, kl_thresh=kl_thresh)
-        return kl_div, losses, info
+        info = self.model.optimize(env_sample_buffer=env_sample_buffer, epochs=epochs, batch_size=batch_size, kl_thresh=kl_thresh)
+        return info
 
 
 @ray.remote
@@ -316,7 +319,7 @@ class Model_Sampler(Worker):
                     next_state_pred, uncertainty = self.model(state, action, update_norm=False)
                     next_state = next_state_pred
                     next_state_denormalized = self.model.inference_model.denormalize_state(next_state_pred)
-                    self.env.set_state(next_state_denormalized)
+                    self.env.set_state(next_state_denormalized.numpy())
                     reward = self.env.compute_reward(action)
                     reward = np.array([reward])
                     done = self.env.compute_done()
@@ -343,9 +346,11 @@ class Policy_Optimizer(Worker):
         super().__init__(model, actor, critic, env_factory)
         self.actor_optim = optim.Adam(self.actor.parameters(), lr=config.actor_lr, eps=config.policy_eps)
         self.critic_optim = optim.Adam(self.critic.parameters(), lr=config.critic_lr, eps=config.policy_eps)
-        self.recurrent = config.policy_recurrent
-        self.grad_clip = config.policy.grad_clip
-        self.clip = config.model_clip
+        self.recurrent = get_recurrent(config.policy_arch_key)
+        self.grad_clip = config.policy_grad_clip
+        self.clip = config.policy_clip
+        self.entropy_coeff = config.policy_entropy_coeff
+        self.old_actor = deepcopy(actor)
 
     def optimize(
         self,
@@ -378,7 +383,12 @@ class Policy_Optimizer(Worker):
                     break
             if done:
                 break
-        return np.mean(kl_divs), np.mean(actor_losses), np.mean(critic_losses)
+        info = {
+            'avg_kl_div': np.mean(kl_divs),
+            'avg_actor_loss': np.mean(actor_losses),
+            'avg_critic_loss': np.mean(critic_losses),
+        }
+        return info
 
     # TODO: check whether to include all the PPO stuff like the clipping, 
     # is it appropriate if we're backpropagating through the world model?
@@ -426,7 +436,6 @@ class Cherry_Picking_Algo(Worker):
         self.discount = config.policy_discount
         self.entropy_coeff = config.policy_entropy_coeff
         self.grad_clip = config.policy_grad_clip
-        # self.env = self.env_factory()
 
         # Initialize ray.
         if not ray.is_initialized():
@@ -438,7 +447,7 @@ class Cherry_Picking_Algo(Worker):
         self.env_samplers = [Env_Sampler.remote(model, actor, critic, env_factory, config) for _ in range(config.workers)]
         self.model_samplers = [Model_Sampler.remote(model, actor, critic, env_factory, config) for _ in range(config.workers)]
         self.model_optimizer = Model_Optimizer.remote(model, actor, critic, env_factory, config)
-        self.policy_optimizer = Policy_Optimizer.remote(model, actor, critic, env_factory, config)
+        if config.learn_policy: self.policy_optimizer = Policy_Optimizer.remote(model, actor, critic, env_factory, config)
 
     def do_iteration(self, config): 
         """
@@ -447,7 +456,7 @@ class Cherry_Picking_Algo(Worker):
         Args:
             max_traj_len (int): maximum trajectory length of an episode
             num_steps (int): number of steps to collect experience for
-            epochs (int): optimzation epochs
+            epochs (int): optimization epochs
             batch_size (int): optimzation batch size
             mirror (bool): Mirror loss enabled or not
             kl_thresh (float): threshold for max kl divergence
@@ -471,7 +480,7 @@ class Cherry_Picking_Algo(Worker):
         # Only model for now.
 
         eval_info_of_workers = ray.get([env_sampler.evaluate_model.remote(trajs=1, max_traj_len=config.env_max_traj_len) for env_sampler in self.env_samplers])
-        eval_info_avg = {np.average([info[key] for info in eval_info_of_workers]) for key in eval_info_of_workers[0].keys()}
+        eval_info_avg = {key: np.average([info[key] for info in eval_info_of_workers]) for key in eval_info_of_workers[0].keys()}
         model_info.update(eval_info_avg)
 
         torch.set_num_threads(1)
@@ -506,30 +515,33 @@ class Cherry_Picking_Algo(Worker):
 
         # Train policy.
 
-        """# Disabling policy learning.
-        # Sync model_samplers and policy_optimizer to current model & policy.
-        for model_sampler in self.model_samplers:
-            model_sampler.sync.remote(model_param_id, actor_param_id, critic_param_id, input_norm=norm_id)
-        self.policy_optimizer.sync.remote(model_param_id, actor_param_id, critic_param_id, input_norm=norm_id)
-        
-        # Collect model experience for policy learning.
-        model_sample_start_time = time()
-        worker_start_state_partitions = [???? for each in self.model_samplers]
-        model_sample_buffers = ray.get([
-            model_sampler.collect_experience.remote(start_states=worker_start_state_partitions[??], max_traj_len=config.env_max_traj_len) 
-            for model_sampler in self.model_samplers])
-        model_sample_buffer = Model_Sample_Buffer.merge_buffers(model_sample_buffers)
-        total_model_steps = len(model_sample_buffer)
-        model_sample_duration = time() - model_sample_start_time
-        model_sample_rate = total_model_steps / model_sample_duration
-        avg_batch_reward = np.mean(model_sample_buffer.ep_returns)
+        if config.learn_policy:
+            # Sync model_samplers and policy_optimizer to current model & policy.
+            for model_sampler in self.model_samplers:
+                model_sampler.sync.remote(model_param_id, actor_param_id, critic_param_id, input_norm=norm_id)
+            self.policy_optimizer.sync.remote(model_param_id, actor_param_id, critic_param_id, input_norm=norm_id)
+            
+            # Collect model experience for policy learning.
+            model_sample_start_time = time()
+            start_states_generator = env_sample_buffer.sample(batch_size=config.policy_batch_size, recurrent=False)
+            worker_start_states_generator = (next(start_states_generator)[0].reshape(-1, self.env.observation_size) for _ in range(len(self.model_samplers)))
+            # worker_start_state_partitions = [???? for each in self.model_samplers]
+            model_sample_buffers = ray.get([
+                # model_sampler.collect_experience.remote(start_states=worker_start_state_partitions[i], max_traj_len=config.env_max_traj_len) 
+                model_sampler.collect_experience.remote(start_states=next(worker_start_states_generator), max_traj_len=config.env_max_traj_len) 
+                for i, model_sampler in enumerate(self.model_samplers)
+            ])
+            model_sample_buffer = Model_Sample_Buffer.merge_buffers(model_sample_buffers)
+            total_model_steps = len(model_sample_buffer)
+            model_sample_duration = time() - model_sample_start_time
+            model_sample_rate = total_model_steps / model_sample_duration
+            avg_batch_reward = np.mean(model_sample_buffer.ep_returns)
 
-        # Update policy with model_sample_buffer and sync to algo.
-        policy_optimizer_info = ray.get(self.policy_optimizer.optimize.remote(ray.put(model_sample_buffer), epochs=config.policy.epochs, batch_size=config.policy.batch_size))
-        policy_info.update(policy_optimizer_info)
-        model_params, actor_params, critic_params, input_norm = ray.get(self.policy_optimizer.retrieve_parameters.remote())
-        self.sync(new_actor_params=actor_params, new_critic_params=critic_params, input_norm=input_norm)
-        """
+            # Update policy with model_sample_buffer and sync to algo.
+            policy_optimizer_info = ray.get(self.policy_optimizer.optimize.remote(ray.put(model_sample_buffer), epochs=config.policy_epochs, batch_size=config.policy_batch_size))
+            policy_info.update(policy_optimizer_info)
+            model_params, actor_params, critic_params, input_norm = ray.get(self.policy_optimizer.retrieve_parameters.remote())
+            self.sync(new_actor_params=actor_params, new_critic_params=critic_params, input_norm=input_norm)
 
         return total_env_steps, model_info, policy_info
 
@@ -572,31 +584,31 @@ class Cherry_Picking_Algo(Worker):
             def parameters(self, *args, **kwargs): return []
         actor = Rand_Policy()
         critic = actor
-        """# Disabling actual policy and critic
-        policy_fixed_std = torch.ones(action_size)*config.policy_fixed_std if np.array(config.policy_fixed_std).size == 1 else torch.Tensor(config.policy_fixed_std)
-        # layers = [int(x) for x in config.policy_layers.split(',')]
-        policy_layers = config.policy_layers
 
-        if hasattr(config, "previous_policy") and config.previous_policy is not None:
-            # TODO: copy optimizer states also???
-            actor   = torch.load(os.path.join(config.previous_policy, "actor.pt"))
-            critic  = torch.load(os.path.join(config.previous_policy, "critic.pt"))
-            print(f"loaded policy from {config.previous_policy}")
-        else:
-            from .nn.roadrunner_nn.actor import LSTM_Stochastic_Actor, GRU_Stochastic_Actor, FF_Stochastic_Actor
-            from .nn.roadrunner_nn.critic import LSTM_V, GRU_V, FF_V
-            if config.policy.arch.lower() == 'lstm':
-                actor   = LSTM_Stochastic_Actor(observation_size, action_size, env_name=config.policy.env, fixed_std=policy_fixed_std, bounded=False, layers=policy_layers)
-                critic  = LSTM_V(observation_size, layers=policy_layers)
-            elif config.policy.arch.lower() == 'gru':
-                actor   = GRU_Stochastic_Actor(observation_size, action_size, env_name=config.policy.env, fixed_std=policy_fixed_std, bounded=False, layers=policy_layers)
-                critic  = GRU_V(observation_size, layers=policy_layers)
-            elif config.policy.arch.lower() == 'ff':
-                actor   = FF_Stochastic_Actor(observation_size, action_size, env_name=config.policy.env, fixed_std=policy_fixed_std, bounded=False, layers=policy_layers)
-                critic  = FF_V(observation_size, layers=policy_layers)
+        if config.learn_policy:
+            # Disabling actual policy and critic
+            policy_fixed_std = torch.ones(action_size)*torch.Tensor(config.policy_fixed_std).item() if np.array(config.policy_fixed_std).size == 1 else torch.Tensor(config.policy_fixed_std)
+            assert policy_fixed_std.size(0) == action_size, policy_fixed_std.size(0)
+            assert policy_fixed_std.dim() == 1
+            # layers = [int(x) for x in config.policy_layers.split(',')]
+
+            if hasattr(config, "previous_policy") and config.previous_policy is not None:
+                # TODO: copy optimizer states also???
+                actor   = torch.load(os.path.join(config.previous_policy, "actor.pt"))
+                critic  = torch.load(os.path.join(config.previous_policy, "critic.pt"))
+                print(f"loaded policy from {config.previous_policy}")
             else:
-                raise ValueError(f"arch config.policy.arch not recognized: {config.policy.arch}")
-        """
+                if config.policy_arch_key.lower() == 'lstm':
+                    actor   = LSTM_Stochastic_Actor(observation_size, action_size, env_name=config.env, fixed_std=policy_fixed_std, bounded=False, layers=config.policy_layers)
+                    critic  = LSTM_V(observation_size, layers=config.policy_layers)
+                elif config.policy_arch_key.lower() == 'gru':
+                    actor   = GRU_Stochastic_Actor(observation_size, action_size, env_name=config.env, fixed_std=policy_fixed_std, bounded=False, layers=config.policy_layers)
+                    critic  = GRU_V(observation_size, layers=config.policy_layers)
+                elif config.policy_arch_key.lower() == 'ff':
+                    actor   = FF_Stochastic_Actor(observation_size, action_size, env_name=config.env, fixed_std=policy_fixed_std, bounded=False, layers=config.policy_layers)
+                    critic  = FF_V(observation_size, layers=config.policy_layers)
+                else:
+                    raise ValueError(f"arch config.policy_arch_key not recognized: {config.policy_arch_key}")
         
         # Prenormalization
         if config.do_prenorm:
@@ -647,11 +659,12 @@ class Cherry_Picking_Algo(Worker):
         # print("\tepochs:             {}".format(config.epochs))
         print("\tworkers:            {}".format(config.workers))
         print()
-        print('\n\n\nHERE\n\n\n')
 
         itr = 0
         timesteps = 0
         best_model_loss = None
+        best_policy_loss = None
+        cumulative_env_samples = 0
         while timesteps < config.timesteps:
             env_steps, model_info, policy_info = algo.do_iteration(config)
 
@@ -661,20 +674,28 @@ class Cherry_Picking_Algo(Worker):
             # print(f"iter {itr:4d} | return: {info['eval_reward']:5.2f} | KL {info['kl']:5.4f} | Actor loss {info['actor_loss']:5.4f} | Critic loss {info['critic_loss']:5.4f} | Model loss {info['model_loss']:5.4f} | ", end='')
             print("timesteps {:n}".format(timesteps))
 
-            if not config.no_log and (best_model_loss is None or info['model_loss'] < best_model_loss):
+            if not config.no_log and (best_model_loss is None or model_info['avg_loss'] < best_model_loss):
                 print("\t(best model so far! saving to {})".format(config.save_model))
-                best_model_loss = info['model_loss']
+                best_model_loss = model_info['avg_loss']
                 torch.save(algo.model, config.save_model)
-            if config.save_actor is not None:
-                torch.save(algo.actor, config.save_actor)
-            if config.save_critic is not None:
-                torch.save(algo.critic, config.save_critic)
+            if config.learn_policy and not config.no_log and (best_policy_loss is None or policy_info['avg_loss'] < best_policy_loss):
+                print("\t(best policy so far! saving to {} and {})".format(config.save_actor, config.save_critic))
+                if config.save_actor is not None:
+                    torch.save(algo.actor, config.save_actor)
+                if config.save_critic is not None:
+                    torch.save(algo.critic, config.save_critic)
 
             if logger is not None:
                 # TODO: make info dicts recursive.
                 for subtitle, info in zip(['model', 'policy'], [model_info, policy_info]):
                     for key, value in info.items():
                         logger.add_scalar(f"{subtitle}/{key}", value, itr)
+                cumulative_env_samples += model_info['num_env_samples']
+                logger.add_scalar(f"model/cumulative_env_samples", cumulative_env_samples, itr)
+
+            if config.model_loss_goal is not None and model_info['avg_loss'] < config.model_loss_goal:
+                print(f"Terminating on model_loss condition: \nmodel avg_loss {model_info['avg_loss']:5.4f} < {config.model_loss_goal:5.4f}")
+                break
 
             itr += 1
         print(f"Finished ({timesteps} of {config.timesteps}).")

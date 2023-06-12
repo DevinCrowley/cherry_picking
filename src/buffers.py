@@ -204,9 +204,9 @@ class Policy_Buffer:
 
 
 """
-================================================================================
-================================================================================
-================================================================================
+================================================================================================================================================================
+================================================================================================================================================================
+================================================================================================================================================================
 """
 
 
@@ -249,7 +249,7 @@ class Model_Buffer:
         """
         self.states      = []
         self.actions     = []
-        self.is_real     = []
+        self.are_real     = []
 
         self.ep_lens = []
 
@@ -297,6 +297,15 @@ class Model_Buffer:
         Args:
             mirror (function pointer): Pointer to the state mirroring function that while mirror observation states
         """
+        with torch.no_grad():
+            self.states = np.array(self.states)
+            self.actions = np.array(self.actions)
+            self.are_real = np.array(self.are_real)
+
+            self.states = torch.Tensor(self.states)
+            self.actions = torch.Tensor(self.actions)
+            self.are_real = torch.Tensor(self.are_real)
+
         self.buffer_ready = True
 
     def sample(self, ensemble_index=None, batch_size=64, recurrent=False):
@@ -323,18 +332,21 @@ class Model_Buffer:
                 if ensemble_index is None:
                     self.rnn_bootstrap_indices_map[ensemble_index] = np.arange(num_trajectories)
                 else:
-                    self.rnn_bootstrap_indices_map[ensemble_index] = np.random.randint(num_trajectories)
+                    self.rnn_bootstrap_indices_map[ensemble_index] = np.random.randint(0, num_trajectories, num_trajectories)
             rnn_bootstrap_indices = self.rnn_bootstrap_indices_map[ensemble_index]
 
             for traj_indices in sampler:
                 bootstrapped_traj_indices = rnn_bootstrap_indices[traj_indices]
 
                 states          = [self.states[    self.traj_idx[i]:self.traj_idx[i+1]] for i in bootstrapped_traj_indices]
+                # Shape: (batch_size, traj_len, state_size)
                 actions         = [self.actions[   self.traj_idx[i]:self.traj_idx[i+1]] for i in bootstrapped_traj_indices]
-                are_real         = [self.are_real[   self.traj_idx[i]:self.traj_idx[i+1]] for i in bootstrapped_traj_indices]
-                traj_mask       = [torch.ones_like(is_real) for is_real in are_real]
+                are_real        = [self.are_real[  self.traj_idx[i]:self.traj_idx[i+1]] for i in bootstrapped_traj_indices]
+                traj_mask       = [torch.ones(len(real_timestep)) for real_timestep in are_real]
+                # Shape: (batch_size, traj_len)
 
                 states          = pad_sequence(states,         batch_first=False)
+                # Shape: (longest_traj_len, batch_size, state_size)
                 actions         = pad_sequence(actions,             batch_first=False)
                 are_real        = pad_sequence(are_real,    batch_first=False)
                 traj_mask       = pad_sequence(traj_mask,           batch_first=False)
@@ -386,9 +398,9 @@ class Model_Buffer:
         for b in buffers:
             offset = len(memory)
 
-            memory.next_states          += b.next_states
-            memory.next_state_preds     += b.next_state_preds
-            memory.actions              += b.actions
+            memory.states    += b.states
+            memory.actions   += b.actions
+            memory.are_real  += b.are_real
 
             memory.ep_lens += b.ep_lens
 
@@ -396,3 +408,44 @@ class Model_Buffer:
             memory.size     += b.size
 
         return memory
+
+    def assimilate_buffer(self, buffer, max_size):
+        """
+        Function to merge a buffer into self. Used for assimilating merged buffers received from multiple remote workers into a single Buffer object to sample from
+
+        Args:
+            buffers (list): List of Buffer objects to merge
+        """
+        assert isinstance(buffer, Model_Buffer)
+        max_size = int(max_size)
+        
+        assert buffer.size <= max_size
+
+        num_outgoing_trajs = 0
+        num_outgoing_elements = 0
+        while self.size + buffer.size - num_outgoing_elements > max_size:
+            num_outgoing_elements += buffer.ep_lens[num_outgoing_trajs]
+            num_outgoing_trajs += 1
+
+        self.size -= np.sum(self.ep_lens[:num_outgoing_trajs])
+        del self.ep_lens    [:num_outgoing_trajs]
+
+        traj_idx_offset = self.traj_idx[num_outgoing_trajs]
+        del self.states     [:traj_idx_offset]
+        del self.actions    [:traj_idx_offset]
+        del self.are_real   [:traj_idx_offset]
+        del self.traj_idx   [:traj_idx_offset]
+
+        for idx in range(len(self.traj_idx)):
+            self.traj_idx[idx] -= traj_idx_offset
+        assert self.traj_idx[0] == 0
+
+        self.states += buffer.states
+        self.actions += buffer.actions
+        self.are_real += buffer.are_real
+        self.ep_lens += buffer.ep_lens
+        self.size += buffer.size
+
+        buffer_traj_idx = np.array(buffer.traj_idx)
+        buffer_traj_idx += self.traj_idx[-1]
+        self.traj_idx += buffer.traj_idx.tolist()

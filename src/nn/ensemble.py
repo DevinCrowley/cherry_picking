@@ -6,18 +6,27 @@ import torch
 
 from .roadrunner_nn.actor import FF_Stochastic_Actor, LSTM_Stochastic_Actor
 
-def get_model_class(model_key):
+def get_recurrent(arch_key):
+    arch_key = arch_key.lower()
+    if 'ff' in arch_key:
+        return False
+    elif 'lstm' in arch_key:
+        return True
+    else:
+        raise NotImplementedError
+
+def get_model_class(model_arch_key):
     # TODO: make these opcc models?
-    if model_key == 'ff':
+    if model_arch_key == 'ff':
         return FF_Stochastic_Actor
-    elif model_key == 'lstm':
+    elif model_arch_key == 'lstm':
         return LSTM_Stochastic_Actor
     else:
-        raise ValueError(f"model_key {model_key} not recognized.")
+        raise ValueError(f"model_arch_key {model_arch_key} not recognized.")
 
 def get_model_factory(config):
-    model_key = config.model_key
-    model_class = get_model_class(model_key)
+    model_arch_key = config.model_arch_key
+    model_class = get_model_class(model_arch_key)
     # TODO: don't hardcode this, react to the actual env.
     from ..envs.cartpole_env import Cartpole_Env
     env_class = Cartpole_Env
@@ -38,6 +47,7 @@ class Ensemble_Network:
         model_eps = config.model_eps
 
         model_factory = get_model_factory(config)
+        self.recurrent = get_recurrent(config.model_arch_key)
 
         self.inference_model = model_factory()
         self.inference_model_optim = torch.optim.Adam(self.inference_model.parameters(), lr=model_lr, eps=model_eps)
@@ -73,8 +83,8 @@ class Ensemble_Network:
 
 
     def __call__(self, *args, **kwargs):
-        self.step(*args, **kwargs)
-    def step(self, state, action, update_norm=False, debug=False):
+        return self.step(*args, **kwargs)
+    def step(self, state, action, update_norm=False):
         # TODO: verify state and action shapes.
         # TODO: remove / verify presence of 'done'?
         
@@ -100,12 +110,6 @@ class Ensemble_Network:
         # uncertainty is the ensemble's average element-wise stdev of the predicted next state.
         uncertainty = torch.std(ensemble_next_state, dim=0).mean()
 
-        output = predicted_next_state, uncertainty
-        if debug: 
-            print("\n\nNOTICE ME\n\n")
-            print(f"output is None: {output is None}")
-            print(f"output: {output}")
-        return output
         return predicted_next_state, uncertainty
 
 
@@ -160,12 +164,13 @@ class Ensemble_Network:
         # next_state_preds_normalized = self.inference_model.normalize_state(next_state_preds, update=False)
 
         # Take the state error and normalize across the state dimension.
-        prediction_errors = torch.linalg.norm((next_state_preds - next_states_normalized)*traj_mask[:-1], dim=-1)
-        loss = prediction_errors.mean()
+        prediction_errors = torch.linalg.norm((next_state_preds - next_states_normalized)*traj_mask.unsqueeze(-1)[1:], dim=-1)
+        # loss = prediction_errors.mean()
+        loss = prediction_errors.sum() / max(1, are_real[1:].sum())
 
         optim = self.inference_model_optim if ensemble_index is None else self.ensemble_optims[ensemble_index]
         optim.zero_grad()
         loss.backward()
         optim.step()
 
-        return loss, kl_div
+        return loss.item(), kl_div
