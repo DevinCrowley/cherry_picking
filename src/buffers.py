@@ -250,6 +250,7 @@ class Model_Buffer:
         self.states      = []
         self.actions     = []
         self.are_real     = []
+        self.next_states = []
 
         self.ep_lens = []
 
@@ -258,7 +259,7 @@ class Model_Buffer:
         self.traj_idx = [0]
         self.buffer_ready = False
 
-    def push(self, state, action, is_real):
+    def push(self, state, action, is_real, next_state=None):
         """
         Store new PPO state (state, action, reward, value, termination)
 
@@ -273,6 +274,7 @@ class Model_Buffer:
         self.states += [state]
         self.actions += [action]
         self.are_real += [is_real]
+        if next_state is not None: self.next_states += [next_state]
 
         self.size += 1
 
@@ -301,10 +303,12 @@ class Model_Buffer:
             self.states = np.array(self.states)
             self.actions = np.array(self.actions)
             self.are_real = np.array(self.are_real)
+            self.next_states = np.array(self.next_states)
 
             self.states = torch.Tensor(self.states)
             self.actions = torch.Tensor(self.actions)
             self.are_real = torch.Tensor(self.are_real)
+            self.next_states = torch.Tensor(self.next_states)
 
         self.buffer_ready = True
 
@@ -354,6 +358,7 @@ class Model_Buffer:
                 yield states, actions, are_real, traj_mask
 
         else: # Not recurrent (ff), get random samples.
+            assert len(self.states) == len(self.next_states)
             num_samples = self.size
             
             random_indices = SubsetRandomSampler(range(num_samples))
@@ -364,18 +369,19 @@ class Model_Buffer:
                 if ensemble_index is None:
                     self.ff_bootstrap_indices_map[ensemble_index] = np.arange(num_samples)
                 else:
-                    self.ff_bootstrap_indices_map[ensemble_index] = np.random.randint(num_samples)
+                    self.ff_bootstrap_indices_map[ensemble_index] = np.random.randint(0, num_samples, num_samples)
             ff_bootstrap_indices = self.ff_bootstrap_indices_map[ensemble_index]
 
             for sample_indices in sampler:
                 bootstrapped_sample_indices = ff_bootstrap_indices[sample_indices]
 
-                states         = self.states        [bootstrapped_sample_indices]
-                actions             = self.actions  [bootstrapped_sample_indices]
-                are_real            = self.are_real [bootstrapped_sample_indices]
-                traj_mask           = 1
+                states              = self.states       [bootstrapped_sample_indices]
+                actions             = self.actions      [bootstrapped_sample_indices]
+                are_real            = self.are_real     [bootstrapped_sample_indices]
+                traj_mask           = torch.ones_like(are_real)
+                next_states         = self.next_states  [bootstrapped_sample_indices]
 
-                yield states, actions, are_real, traj_mask
+                yield states, actions, are_real, traj_mask, next_states
 
     @classmethod
     def merge_buffers(cls, buffers):
@@ -401,6 +407,7 @@ class Model_Buffer:
             memory.states    += b.states
             memory.actions   += b.actions
             memory.are_real  += b.are_real
+            memory.next_states  += b.next_states
 
             memory.ep_lens += b.ep_lens
 
@@ -419,22 +426,24 @@ class Model_Buffer:
         assert isinstance(buffer, Model_Buffer)
         max_size = int(max_size)
         
-        assert buffer.size <= max_size
+        assert buffer.size <= max_size, f"buffer.size: {buffer.size}, max_size: {max_size}"
 
         num_outgoing_trajs = 0
         num_outgoing_elements = 0
         while self.size + buffer.size - num_outgoing_elements > max_size:
-            num_outgoing_elements += buffer.ep_lens[num_outgoing_trajs]
+            num_outgoing_elements += self.ep_lens[num_outgoing_trajs]
             num_outgoing_trajs += 1
-
-        self.size -= np.sum(self.ep_lens[:num_outgoing_trajs])
-        del self.ep_lens    [:num_outgoing_trajs]
-
         traj_idx_offset = self.traj_idx[num_outgoing_trajs]
+        # print(f"\n\nself.size: {self.size}, buffer.size: {buffer.size}, max_size: {max_size}, num_outgoing_elements: {num_outgoing_elements}, num_outgoing_trajs: {num_outgoing_trajs}, len(self.traj_idx): {len(self.traj_idx)}, traj_idx_offset: {traj_idx_offset}")
+
+        self.size -= np.sum(self.ep_lens[:num_outgoing_trajs], dtype=int)
+        del self.ep_lens    [:num_outgoing_trajs]
+        del self.traj_idx   [:num_outgoing_trajs]
+
         del self.states     [:traj_idx_offset]
         del self.actions    [:traj_idx_offset]
         del self.are_real   [:traj_idx_offset]
-        del self.traj_idx   [:traj_idx_offset]
+        del self.next_states   [:traj_idx_offset]
 
         for idx in range(len(self.traj_idx)):
             self.traj_idx[idx] -= traj_idx_offset
@@ -443,9 +452,10 @@ class Model_Buffer:
         self.states += buffer.states
         self.actions += buffer.actions
         self.are_real += buffer.are_real
+        self.next_states += buffer.next_states
         self.ep_lens += buffer.ep_lens
         self.size += buffer.size
 
         buffer_traj_idx = np.array(buffer.traj_idx)
         buffer_traj_idx += self.traj_idx[-1]
-        self.traj_idx += buffer.traj_idx.tolist()
+        self.traj_idx += buffer_traj_idx.tolist()

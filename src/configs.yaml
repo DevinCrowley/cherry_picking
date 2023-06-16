@@ -1,7 +1,7 @@
 defaults:
 
   # Universal
-  run_name: 'cartpole_rand_dynamics_new_loss_to_0.01_u_max_0.05'
+  run_name: 'cartpole_rand_dynamics_ff_buffer_queue_oc5%_smooth_eval_loss_to_0.015_u_max_0.02'
   env: 'Cartpole_Env'
   seed: 0
   verbose: False
@@ -15,21 +15,23 @@ defaults:
   logdir: "./logs/"
 
   # Model
-  model_arch_key: 'lstm' # 'ff'
+  # model_arch_key: 'lstm' # 'ff'
+  model_arch_key: 'ff' # 'lstm'
   model_layers: [64, 64]
   model_lr: 1e-3
   model_eps: 1e-6
   model_num_ensemble: 10
   env_max_traj_len: 100
-  num_env_steps: 5000 # env steps per iteration
+  num_env_steps: 2000 # env steps per iteration
   model_epochs: 3
   model_batch_size: 64
-  model_buffer_max_size: 1000
+  model_buffer_max_size: 6000
   previous_model: None
-  # uncertainty_max: 0.05
+  override_confidence: 0.05
   model_learn_norm: False
-  uncertainty_max: 0.05
-  model_loss_goal: 0.01 # None
+  evaluate_model_trajs: 20
+  model_loss_goal: 0.015 # None
+  uncertainty_max: 0.02
 
   # Policy
   learn_policy: False

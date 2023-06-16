@@ -126,8 +126,8 @@ class Ensemble_Network:
             # for ensemble_index, net in zip(nets, ensemble_indices):
             for ensemble_index in ensemble_indices:
                 for batch in env_sample_buffer.sample(batch_size=batch_size, recurrent=self.recurrent, ensemble_index=ensemble_index):
-                    states, actions, are_real, traj_mask = batch
-                    loss, kl_div = self._update(ensemble_index, states, actions, are_real, traj_mask)
+                    states, actions, are_real, traj_mask, next_states = batch
+                    loss, kl_div = self._update(ensemble_index, states, actions, are_real, traj_mask, next_states)
                     losses.append(loss)
                     # Note: kl_div not implemented atm.
                     # if max(kl_divs) > kl_thresh:
@@ -141,7 +141,7 @@ class Ensemble_Network:
         return info
 
     # TODO: propagate use of traj_mask.
-    def _update(self, ensemble_index, states, actions, are_real, traj_mask):
+    def _update(self, ensemble_index, states, actions, are_real, traj_mask, next_states):
         """
         Compute loss and invoke the corresponding network's optimizer.
         Assumes everything is normalized already.
@@ -159,7 +159,10 @@ class Ensemble_Network:
         # TODO: adjust collection to include the terminating state and not waste the last state-action input.
         all_state_actions_normalized = self.inference_model.normalize_state(all_state_actions, update=False)
         states_normalized = all_state_actions_normalized[:-1, ..., :states.shape[-1]] # Skip last time step.
-        next_states_normalized = all_state_actions_normalized[1:, ..., :states.shape[-1]] # Skip first time step.
+        if self.recurrent:
+            next_states_normalized = all_state_actions_normalized[1:, ..., :states.shape[-1]] # Skip first time step.
+        else:
+            next_states_normalized = self.inference_model.normalize_state(next_states[:-1], update=False) # Skip last time step.
         next_state_preds = net(state_actions, update_norm=False)
         # next_state_preds_normalized = self.inference_model.normalize_state(next_state_preds, update=False)
 

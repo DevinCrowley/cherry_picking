@@ -123,6 +123,9 @@ class Env_Sampler(Worker):
         self.uncertainty_max = config.uncertainty_max
         self.learn_norm = config.model_learn_norm
 
+        self.model_recurrent = get_recurrent(config.model_arch_key)
+        self.override_confidence = config.override_confidence
+
     def collect_experience(self, max_traj_len, min_steps):
         """
         Function to sample experience
@@ -161,7 +164,7 @@ class Env_Sampler(Worker):
 
                     # TODO: check how opcc does this?
                     next_state_pred, uncertainty = self.model(state, action, update_norm=self.learn_norm)
-                    if uncertainty > self.uncertainty_max:
+                    if (uncertainty > self.uncertainty_max) or (np.random.random() < self.override_confidence):
                         next_state, reward, done, info = self.env.step(action.numpy())
                         next_state = torch.Tensor(next_state)
                         next_state_is_real = 1
@@ -173,7 +176,10 @@ class Env_Sampler(Worker):
                         done = self.env.compute_done()
                         next_state_is_real = 0
                     
-                    env_sample_buffer.push(state.numpy(), action.numpy(), state_is_real)
+                    if self.model_recurrent:
+                        env_sample_buffer.push(state.numpy(), action.numpy(), state_is_real)
+                    elif next_state_is_real:
+                        env_sample_buffer.push(state.numpy(), action.numpy(), next_state_is_real, next_state.numpy())
                     
                     state = next_state
                     state_is_real = next_state_is_real
@@ -181,7 +187,7 @@ class Env_Sampler(Worker):
                     num_steps += 1
                 env_sample_buffer.end_trajectory()
 
-        return env_sample_buffer
+        return env_sample_buffer, num_steps
     
     def evaluate_model(self, trajs=1, max_traj_len=400):
         """
@@ -449,6 +455,8 @@ class Cherry_Picking_Algo(Worker):
         self.model_optimizer = Model_Optimizer.remote(model, actor, critic, env_factory, config)
         if config.learn_policy: self.policy_optimizer = Policy_Optimizer.remote(model, actor, critic, env_factory, config)
 
+        self.env_sample_buffer_queue = Env_Sample_Buffer()
+
     def do_iteration(self, config): 
         """
         Function to do a single iteration of Cherry Picking
@@ -479,7 +487,7 @@ class Cherry_Picking_Algo(Worker):
         # Evaluate model & policy.
         # Only model for now.
 
-        eval_info_of_workers = ray.get([env_sampler.evaluate_model.remote(trajs=1, max_traj_len=config.env_max_traj_len) for env_sampler in self.env_samplers])
+        eval_info_of_workers = ray.get([env_sampler.evaluate_model.remote(trajs=config.evaluate_model_trajs, max_traj_len=config.env_max_traj_len) for env_sampler in self.env_samplers])
         eval_info_avg = {key: np.average([info[key] for info in eval_info_of_workers]) for key in eval_info_of_workers[0].keys()}
         model_info.update(eval_info_avg)
 
@@ -494,21 +502,27 @@ class Cherry_Picking_Algo(Worker):
 
         # Collect env experience for model learning.
         env_sample_start_time = time()
-        env_sample_buffers = ray.get([
+        collection_output = ray.get([
             env_sampler.collect_experience.remote(max_traj_len=config.env_max_traj_len, min_steps=env_samples_per_worker) 
             for env_sampler in self.env_samplers])
+        env_sample_buffers, total_steps = list(zip(*collection_output))
+        total_steps = np.sum(total_steps)
         env_sample_buffer = Env_Sample_Buffer.merge_buffers(env_sample_buffers)
         # Delete buffers to free up memory? Might not be necessary
         del env_sample_buffers
-        total_env_steps = len(env_sample_buffer)
+        self.env_sample_buffer_queue.assimilate_buffer(env_sample_buffer, max_size=config.model_buffer_max_size)
+        # TODO: make total_steps reflect the number of steps actually taken, not just recorded.
+        num_env_steps = len(env_sample_buffer)
         env_sample_duration = time() - env_sample_start_time
-        env_sample_rate = total_env_steps / env_sample_duration
+        env_sample_rate = num_env_steps / env_sample_duration
         model_info['env_sample_rate'] = env_sample_rate
-        model_info['num_env_samples'] = np.sum(env_sample_buffer.are_real)
-        model_info['proportion_env_samples'] = model_info['num_env_samples'] / total_env_steps
+        model_info['num_env_samples'] = num_env_steps
+        assert num_env_steps == np.sum(env_sample_buffer.are_real)
+        model_info['proportion_env_samples'] = model_info['num_env_samples'] / max(1, total_steps)
+        del env_sample_buffer
 
-        # Update model with env_sample_buffer and sync to algo.
-        model_optimizer_info = ray.get(self.model_optimizer.optimize.remote(ray.put(env_sample_buffer), epochs=config.model_epochs, batch_size=config.model_batch_size))
+        # Update model with env_sample_buffer_queue and sync to algo.
+        model_optimizer_info = ray.get(self.model_optimizer.optimize.remote(ray.put(self.env_sample_buffer_queue), epochs=config.model_epochs, batch_size=config.model_batch_size))
         model_info.update(model_optimizer_info)
         model_params, actor_params, critic_params, input_norm = ray.get(self.model_optimizer.retrieve_parameters.remote())
         self.sync(new_model_params=model_params, input_norm=input_norm)
@@ -543,7 +557,7 @@ class Cherry_Picking_Algo(Worker):
             model_params, actor_params, critic_params, input_norm = ray.get(self.policy_optimizer.retrieve_parameters.remote())
             self.sync(new_actor_params=actor_params, new_critic_params=critic_params, input_norm=input_norm)
 
-        return total_env_steps, model_info, policy_info
+        return total_steps, model_info, policy_info
 
     @classmethod
     def run(cls, config):
@@ -666,9 +680,9 @@ class Cherry_Picking_Algo(Worker):
         best_policy_loss = None
         cumulative_env_samples = 0
         while timesteps < config.timesteps:
-            env_steps, model_info, policy_info = algo.do_iteration(config)
+            steps, model_info, policy_info = algo.do_iteration(config)
 
-            timesteps += env_steps
+            timesteps += steps
             print(f"iter {itr:4d}")
             for key, val in model_info.items(): print(f"{key}: {val:5.4f} | ", end='')
             # print(f"iter {itr:4d} | return: {info['eval_reward']:5.2f} | KL {info['kl']:5.4f} | Actor loss {info['actor_loss']:5.4f} | Critic loss {info['critic_loss']:5.4f} | Model loss {info['model_loss']:5.4f} | ", end='')
