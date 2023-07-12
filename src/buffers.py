@@ -373,6 +373,7 @@ class Model_Buffer:
             ff_bootstrap_indices = self.ff_bootstrap_indices_map[ensemble_index]
 
             for sample_indices in sampler:
+                print(f"\\nnDEBUG\n\nlen(ff_bootstrap_indices): {len(ff_bootstrap_indices)}, len(sample_indices): {len(sample_indices)}, max(sample_indices): {max(sample_indices)}")
                 bootstrapped_sample_indices = ff_bootstrap_indices[sample_indices]
 
                 states              = self.states       [bootstrapped_sample_indices]
@@ -427,6 +428,13 @@ class Model_Buffer:
         max_size = int(max_size)
         
         assert buffer.size <= max_size, f"buffer.size: {buffer.size}, max_size: {max_size}"
+
+        if self.buffer_ready:
+            self.states =       [*self.states.numpy()]
+            self.actions =      [*self.actions.numpy()]
+            self.are_real =     [*self.are_real.numpy()]
+            self.next_states =  [*self.next_states.numpy()]
+            self.buffer_ready = False
 
         num_outgoing_trajs = 0
         num_outgoing_elements = 0

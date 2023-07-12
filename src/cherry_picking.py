@@ -57,6 +57,17 @@ Big TODOs:
 
 Plan:
     - Model_Optimizer --> call model.update, update self with new model params.
+
+Thoughts:
+    - Leverage ensemble for inference by choosing the next_state that all models agree with the most? Requires more noodling.
+
+
+Daimler TODOs:
+    - OPCC
+        - Learn normalization
+        - Learn inherent variance
+    - Dreamer
+        - Separate deterministic and stochastic components in the model with RSSM
 """
 
 
@@ -536,8 +547,9 @@ class Cherry_Picking_Algo(Worker):
             self.policy_optimizer.sync.remote(model_param_id, actor_param_id, critic_param_id, input_norm=norm_id)
             
             # Collect model experience for policy learning.
+            # TODO: make this smarter, respect config.policy_batch_size.
             model_sample_start_time = time()
-            start_states_generator = env_sample_buffer.sample(batch_size=config.policy_batch_size, recurrent=False)
+            start_states_generator = self.env_sample_buffer_queue.sample(batch_size=len(self.env_sample_buffer_queue)//len(self.model_samplers), recurrent=False)
             worker_start_states_generator = (next(start_states_generator)[0].reshape(-1, self.env.observation_size) for _ in range(len(self.model_samplers)))
             # worker_start_state_partitions = [???? for each in self.model_samplers]
             model_sample_buffers = ray.get([
